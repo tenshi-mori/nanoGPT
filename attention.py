@@ -123,36 +123,41 @@ class flash_attn(nn.Module):
         y = self.c_proj(y)
         return y
 
+class grouped_query_attn(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # This line is a little confusing becausing do we count key and value heads separately or together.
+        # Not really sure but OpenAI people said key and value should be grouped together so I'll follow their lead
+        qkv_dim = config.head_dim * (config.num_attn_heads + 2 * config.num_kv_heads) 
+        self.c_attn = nn.Linear(config.n_embd, qkv_dim, bias = config.bias)
+        self.c_proj = nn.Linear(config.num_attn_heads * config.head_dim, config.n_embd, bias = config.bias)
+    def forward(self, x: Float[Tensor, "b t n_embd"]) -> Float[Tensor, "b t n_embd"]:
+        qkv = self.c_attn(x)
+        qkv_parts = (
+            config.num_attn_heads * config.head_dim,
+            config.num_kv_heads * config.head_dim,
+            config.num_kv_heads * config.head_dim,
+        )
+        q, k, v = torch.split(qkv, qkv_parts, dim = -1)
+
+        q = einops.rearrange(q, "b t (nh dh) -> b nh t dh", dh = config.head_dim)
+        k = einops.rearrange(k, "b s (nh dh) -> b nh s dh", dh = config.head_dim)
+        v = einops.rearrange(v, "b s (nh dh) -> b nh s dh", dh = config.head_dim)
+
+        q = einops.rearrange(q, "b (na nkv) t dh -> b na nkv t dh", nkv = config.num_kv_heads)
+        attn_score = einops.einsum(q, k, "b na nkv t dh, b nh s dh -> b nh t s") * (1.0 / math.sqrt(config.head_dim))
+        attn = F.softmax(attn_score, dim=-1)
+        y = attn @ v
+        y = einops.rearrange(y, "b nh t dh -> b t (nh dh)")
+        return y
 if __name__ =="__main__":
     class Config:
         n_embd = 64
-        block_size = 128
         bias = True
-        dropout = 0.0
-        n_head = 4
-        b_c = 32 # Block size for keys/values
-        b_r = 32 # Block size for queries
+        head_dim = 4
+        num_attn_heads = 8
+        num_kv_heads = 2
     config = Config()
-    model = causal_attention(config)
-    flash_model = flash_attn(config)
-    batch_size = 2
-    seq_len = 50
-
-    torch.manual_seed(42)
-    x = torch.randn(batch_size, seq_len, config.n_embd)
-
-    # Causal Attention weights
-    model.c_attn.weight.data = flash_model.c_attn.weight.data = torch.randn_like(model.c_attn.weight.data)
-    model.c_attn.bias.data = flash_model.c_attn.bias.data = torch.randn_like(model.c_attn.bias.data)
-    model.c_proj.weight.data = flash_model.c_proj.weight.data = torch.randn_like(model.c_proj.weight.data)
-    model.c_proj.bias.data = flash_model.c_proj.bias.data = torch.randn_like(model.c_proj.bias.data)
-
-    model.eval()
-    with torch.no_grad():
-        y = model(x)
-
-    flash_model.eval()
-    with torch.no_grad():
-        y_flash = flash_model(x)
-    assert torch.allclose(y_flash, y, atol=1e-4)
-    print("Flash Attention Values Test Passed!")
+    x = torch.randn(1, 256, 64)
+    model = grouped_query_attn(config)
+    model(x)
