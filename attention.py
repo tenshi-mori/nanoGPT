@@ -10,7 +10,7 @@ from jaxtyping import Float
 NEG_INF = torch.tensor(float("-inf"))
 EPSILON = 1e-10 # Revert to original epsilon value
 
-class causal_attention(nn.Module):
+class causal_attn(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias = config.bias)
@@ -131,7 +131,11 @@ class grouped_query_attn(nn.Module):
         qkv_dim = config.head_dim * (config.num_attn_heads + 2 * config.num_kv_heads) 
         self.c_attn = nn.Linear(config.n_embd, qkv_dim, bias = config.bias)
         self.c_proj = nn.Linear(config.num_attn_heads * config.head_dim, config.n_embd, bias = config.bias)
+
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size))
     def forward(self, x: Float[Tensor, "b t n_embd"]) -> Float[Tensor, "b t n_embd"]:
+        b, t, n_embd = x.shape
         qkv = self.c_attn(x)
         qkv_parts = (
             config.num_attn_heads * config.head_dim,
@@ -146,10 +150,45 @@ class grouped_query_attn(nn.Module):
 
         q = einops.rearrange(q, "b (na nkv) t dh -> b na nkv t dh", nkv = config.num_kv_heads)
         attn_score = einops.einsum(q, k, "b na nkv t dh, b nh s dh -> b nh t s") * (1.0 / math.sqrt(config.head_dim))
+        attn_score = attn_score.masked_fill(self.mask[:, :, :t, :t] == 0, float("-inf"))
         attn = F.softmax(attn_score, dim=-1)
         y = attn @ v
         y = einops.rearrange(y, "b nh t dh -> b t (nh dh)")
         return y
+
+class latent_attn(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+        self.d_q_latent = config.d_q_latent
+        self.d_kv_latent = config.d_kv_latent
+        self.d_head = self.n_embd // self.n_head
+
+        self.wq_d = nn.Linear(self.n_embd, self.d_q_latent)
+        self.wqk = nn.Linear(self.d_q_latent, self.n_head * self.d_kv_latent)
+        self.wkv_d = nn.Linear(self.n_embd, self.d_kv_latent)
+        self.wv_u = nn.Linear(self.d_kv_latent, self.n_head * self.d_head)
+
+        self.wo = nn.Linear(self.n_embd, self.n_embd)
+
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x: Float[Tensor, "b t n_embd"]) -> Float[Tensor, "b t n_embd"]:
+        b, t, n_embd = x.shape
+        q_c = self.wq_d(x)
+        kv_c = self.wkv_d(x)
+        qk_c = einops.rearrange(self.wqk(q_c), "b t (nh d_kv_l) -> b nh t d_kv_l", nh = self.n_head, d_kv_l = self.d_kv_latent)
+        attn_score = (qk_c @ einops.rearrange(kv_c, "b t dk -> b 1 dk t")) / math.sqrt(self.d_kv_latent)
+        attn_score = attn_score.masked_fill(self.mask[:, :, :t, :t] == 0, float("-inf"))
+
+        attn = F.softmax(attn_score, dim =-1)
+        v = einops.rearrange(self.wv_u(kv_c), "b t (nh dh) -> b nh t dh", nh = self.n_head, dh = self.d_head)
+        out = attn @ v
+        out = self.wo(einops.rearrange(out, "b nh t dh -> b t (nh dh)"))
+        return out
+        
 if __name__ =="__main__":
     class Config:
         n_embd = 64
@@ -161,3 +200,19 @@ if __name__ =="__main__":
     x = torch.randn(1, 256, 64)
     model = grouped_query_attn(config)
     model(x)
+
+    print("\nTesting latent_attn:")
+    class LatentAttnConfig:
+        n_embd = 64
+        n_head = 8
+        d_q_latent = 32
+        d_kv_latent = 16
+        d_head = 8 # n_embd // n_head
+        bias = True
+        block_size = 10 # Assuming sequence length of 10 for latent_x
+    
+    latent_config = LatentAttnConfig()
+    latent_model = latent_attn(latent_config)
+    latent_x = torch.randn(1, 10, latent_config.n_embd) # Batch, Sequence Length, Embedding Dimension
+    latent_output = latent_model(latent_x)
+    print(f"Latent Attention output shape: {latent_output.shape}")
