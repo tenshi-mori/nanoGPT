@@ -8,3 +8,4 @@ Implemented things:
 - Grouped-Query Attention (GQA)
 - FlashAttention
 - Rotary Position Embeddings (RoPE)
+- Multi-head Latent Attention (MLA)
